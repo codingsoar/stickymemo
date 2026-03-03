@@ -8,6 +8,7 @@ import sys
 import os
 import json
 import uuid
+import re
 from datetime import datetime
 import winreg
 import ctypes
@@ -57,39 +58,91 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
+def html_to_plain(html_content):
+    """HTML 콘텐츠에서 plain text만 추출 (Qt 엔진 사용)"""
+    if not html_content:
+        return ""
+    from PySide6.QtGui import QTextDocument
+    doc = QTextDocument()
+    doc.setHtml(html_content)
+    return doc.toPlainText().strip()
+
+
 class ImageTextEdit(QTextEdit):
     """이미지 붙여넣기를 지원하는 커스텀 QTextEdit"""
     
+    def canInsertFromMimeData(self, source):
+        """이미지 MIME 데이터 허용"""
+        if source.hasImage():
+            return True
+        if source.hasUrls():
+            for url in source.urls():
+                path = url.toLocalFile().lower()
+                if path.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')):
+                    return True
+        return super().canInsertFromMimeData(source)
+    
     def insertFromMimeData(self, source):
         """클립보드에서 이미지가 있으면 이미지를 삽입"""
+        image = None
+        
+        # 1. 클립보드에서 직접 이미지 가져오기 (스크린샷, 복사된 이미지)
         if source.hasImage():
-            image = QImage(source.imageData())
-            if not image.isNull():
-                # 고유 파일명으로 이미지 저장
-                img_name = f"img_{uuid.uuid4().hex[:8]}.png"
-                img_path = os.path.join(IMAGES_DIR, img_name)
-                image.save(img_path, "PNG")
-                
-                # 이미지가 너무 크면 위젯 너비에 맞게 축소
-                max_width = self.viewport().width() - 20
-                if image.width() > max_width:
-                    image = image.scaledToWidth(max_width, Qt.SmoothTransformation)
-                
-                # 문서에 이미지 리소스 등록 후 삽입
-                cursor = self.textCursor()
-                doc = self.document()
-                img_url = f"file:///{img_path.replace(os.sep, '/')}"
-                doc.addResource(doc.ImageResource, img_url, image)
-                
-                img_fmt = QTextImageFormat()
-                img_fmt.setName(img_url)
-                img_fmt.setWidth(image.width())
-                img_fmt.setHeight(image.height())
-                cursor.insertImage(img_fmt)
-                return
+            image = source.imageData()
+            if isinstance(image, QImage):
+                pass  # 이미 QImage
+            elif image is not None:
+                image = QImage(image)
+            
+            # 여전히 실패하면 클립보드에서 직접 가져오기
+            if image is None or (isinstance(image, QImage) and image.isNull()):
+                clipboard = QApplication.clipboard()
+                image = clipboard.image()
+        
+        # 2. 파일 URL로 이미지 붙여넣기 (탐색기에서 복사한 파일)
+        if (image is None or (isinstance(image, QImage) and image.isNull())) and source.hasUrls():
+            for url in source.urls():
+                path = url.toLocalFile()
+                if path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')):
+                    image = QImage(path)
+                    if not image.isNull():
+                        break
+        
+        # 이미지가 유효하면 삽입
+        if image is not None and isinstance(image, QImage) and not image.isNull():
+            self._insert_image(image)
+            return
         
         # 이미지가 아니면 기본 동작 (텍스트 붙여넣기)
         super().insertFromMimeData(source)
+    
+    def _insert_image(self, image):
+        """QImage를 파일로 저장하고 문서에 삽입"""
+        # 고유 파일명으로 이미지 저장
+        img_name = f"img_{uuid.uuid4().hex[:8]}.png"
+        img_path = os.path.join(IMAGES_DIR, img_name)
+        image.save(img_path, "PNG")
+        
+        # 이미지가 너무 크면 위젯 너비에 맞게 축소 (표시용)
+        max_width = self.viewport().width() - 20
+        display_w = image.width()
+        display_h = image.height()
+        if display_w > max_width:
+            ratio = max_width / display_w
+            display_w = max_width
+            display_h = int(display_h * ratio)
+        
+        # 문서에 이미지 리소스 등록 후 삽입
+        cursor = self.textCursor()
+        doc = self.document()
+        img_url = f"file:///{img_path.replace(os.sep, '/')}"
+        doc.addResource(1, img_url, image)
+        
+        img_fmt = QTextImageFormat()
+        img_fmt.setName(img_url)
+        img_fmt.setWidth(display_w)
+        img_fmt.setHeight(display_h)
+        cursor.insertImage(img_fmt)
 
 
 class SlotWidget(QWidget):
@@ -370,11 +423,13 @@ class StickyNoteWindow(QWidget):
             self.is_pinned = data.get("pinned", False)
             self.is_locked = data.get("locked", False)
             self.is_minimized = data.get("minimized", False)
+            self.is_desktop = data.get("desktop", False)
             self.alpha = data.get("alpha", 0.95)
             self.font_size = data.get("font_size", 12)
             self.created_at = data.get("created_at", datetime.now().isoformat())
             self.updated_at = data.get("updated_at", datetime.now().isoformat())
-            initial_content = data.get("content", "")
+            initial_html = data.get("content_html", "")
+            initial_plain = data.get("content", "")
             geo = data.get("geometry", "380x400+150+150")
         else:
             self.uuid = str(uuid.uuid4())
@@ -382,11 +437,13 @@ class StickyNoteWindow(QWidget):
             self.is_pinned = False
             self.is_locked = False
             self.is_minimized = False
+            self.is_desktop = False
             self.alpha = 0.95
             self.font_size = 12
             self.created_at = datetime.now().isoformat()
             self.updated_at = datetime.now().isoformat()
-            initial_content = ""
+            initial_html = ""
+            initial_plain = ""
             offset = len(app.notes) * 30
             geo = f"380x400+{150 + offset}+{120 + offset}"
         
@@ -399,21 +456,24 @@ class StickyNoteWindow(QWidget):
         
         self._setup_ui()
         self._apply_geometry(geo)
-        # HTML 콘텐츠면 HTML로 로드, 아니면 plain text로 로드 (하위 호환)
-        if initial_content.startswith("<!DOCTYPE") or initial_content.startswith("<"):
-            self.text_edit.setHtml(initial_content)
-            # HTML에 포함된 이미지 리소스 재등록
+        # HTML이 있으면 HTML로 로드 (서식+이미지 보존), 없으면 plain text
+        if initial_html:
+            self.text_edit.setHtml(initial_html)
+            self._reload_images()
+        elif initial_plain.startswith("<!DOCTYPE") or initial_plain.startswith("<html"):
+            # 이전 버전 하위 호환: content에 HTML이 저장된 경우
+            self.text_edit.setHtml(initial_plain)
             self._reload_images()
         else:
-            self.text_edit.setPlainText(initial_content)
+            self.text_edit.setPlainText(initial_plain)
         self._update_title()
         self.setWindowOpacity(self.alpha)
         
         if self.is_pinned:
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             
-        # 데스크탑 모드 상태면 적용
-        if self.app.is_desktop_mode:
+        # 개별 데스크탑 모드 상태 적용
+        if self.is_desktop:
             self.set_desktop_mode(True)
         
     def _setup_ui(self):
@@ -479,6 +539,13 @@ class StickyNoteWindow(QWidget):
         self.lock_btn.setStyleSheet(btn_style)
         self.lock_btn.clicked.connect(self.toggle_lock)
         header_layout.addWidget(self.lock_btn)
+        
+        # 데스크톱 위젯 모드 버튼
+        self.desktop_btn = QPushButton("🖥️")
+        self.desktop_btn.setStyleSheet(btn_style)
+        self.desktop_btn.setToolTip("데스크톱 위젯 모드")
+        self.desktop_btn.clicked.connect(self.toggle_desktop)
+        header_layout.addWidget(self.desktop_btn)
         
         # 최소화 버튼
         self.min_btn = QPushButton("─")
@@ -888,9 +955,11 @@ class StickyNoteWindow(QWidget):
         return {
             "uuid": self.uuid,
             "geometry": self.restored_geometry,
-            "content": self.text_edit.toHtml(),
+            "content": self.text_edit.toPlainText(),
+            "content_html": self.text_edit.toHtml(),
             "pinned": self.is_pinned,
             "locked": self.is_locked,
+            "desktop": self.is_desktop,
             "color_index": self.color_index,
             "minimized": self.is_minimized,
             "alpha": self.alpha,
@@ -921,13 +990,19 @@ class StickyNoteWindow(QWidget):
                         if os.path.exists(local_path):
                             image = QImage(local_path)
                             if not image.isNull():
-                                doc.addResource(doc.ImageResource, img_url, image)
+                                doc.addResource(1, img_url, image)
                 it += 1
             block = block.next()
     
     def closeEvent(self, event):
         self.closed.emit(self)
         event.accept()
+    
+    def toggle_desktop(self):
+        """데스크톱 위젯 모드 토글"""
+        self.is_desktop = not self.is_desktop
+        self.set_desktop_mode(self.is_desktop)
+        self.schedule_save()
 
     def set_desktop_mode(self, enabled):
         """데스크탑 위젯 모드 전환"""
@@ -1164,9 +1239,13 @@ class NoteListDialog(QDialog):
         info_layout.setSpacing(4)
         
         content = data.get("content", "")
+        # 이전 버전 하위 호환: content에 HTML이 들어있으면 변환
+        if content.startswith("<") or content.startswith("<!DOCTYPE"):
+            content = html_to_plain(content)
         lines = content.split('\n')
+        lines = [l.strip() for l in lines if l.strip()]
         current_title = lines[0] if lines else ""
-        preview = lines[1][:50] if len(lines) > 1 and lines[1].strip() else "내용 없음"
+        preview = lines[1][:50] if len(lines) > 1 else "내용 없음"
         
         # 제목 (수정 가능)
         title_edit = QLineEdit(current_title)
@@ -1222,31 +1301,12 @@ class NoteListDialog(QDialog):
         self.list_layout.addWidget(row)
     
     def _update_title(self, data, new_title):
-        """제목 수정 처리"""
-        content = data.get("content", "")
-        lines = content.split('\n')
+        """제목 수정 처리 - 열려있는 메모의 텍스트 에디터를 직접 수정"""
+        uid = data.get("uuid")
         
-        # 기존 내용 유지하면서 첫 줄만 변경
-        if not lines:
-            new_content = new_title
-        else:
-            lines[0] = new_title
-            new_content = "\n".join(lines)
-            
-        # 데이터 업데이트
-        data["content"] = new_content
-        data["updated_at"] = datetime.now().isoformat()
-        
-        # 열려있는 메모가 있다면 내용 갱신
+        # 열려있는 메모의 첫 줄 수정
         for note in self.app.notes:
-            if note.uuid == data.get("uuid"):
-                # 커서 위치 유지 등을 위해 텍스트 전체 교체보다는 첫 줄 교체 시도?
-                # 복잡하므로 단순하게 리로드하지 않고, 데이터만 동기화
-                # 사용자가 텍스트박스에서 제목을 고쳤으므로, 메모 창의 제목도 바뀌어야 함
-                # 하지만 텍스트 에디터 내용을 강제로 바꾸면 입력 중 충돌 가능성.
-                # 여기서는 '데이터'만 바꾸고, 메모 창의 타이틀바만 갱신해준다.
-                # 실제 텍스트 에디터 내용 동기화는 복잡할 수 있음.
-                # 간단히: 텍스트 에디터의 첫 줄도 바꿔준다.
+            if note.uuid == uid:
                 note.text_edit.blockSignals(True)
                 doc = note.text_edit.document()
                 cursor = QTextCursor(doc)
@@ -1254,10 +1314,28 @@ class NoteListDialog(QDialog):
                 cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
                 cursor.insertText(new_title)
                 note.text_edit.blockSignals(False)
-                
+                note._update_title()
+                # to_dict()로 최신 HTML 가져오기
+                data["content"] = note.text_edit.toHtml()
+                data["updated_at"] = datetime.now().isoformat()
+                self.app.save_notes()
+                return
+        
+        # 닫힌 메모: 메모를 열어서 수정
+        self.app.show_or_open_note(uid)
+        for note in self.app.notes:
+            if note.uuid == uid:
+                note.text_edit.blockSignals(True)
+                doc = note.text_edit.document()
+                cursor = QTextCursor(doc)
+                cursor.movePosition(QTextCursor.Start)
+                cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
+                cursor.insertText(new_title)
+                note.text_edit.blockSignals(False)
                 note._update_title()
                 break
         
+        data["updated_at"] = datetime.now().isoformat()
         self.app.save_notes()
     
     def _on_open(self, uid):
@@ -1326,8 +1404,11 @@ class SearchDialog(QDialog):
         # 모든 저장된 메모 검색
         for data in self.app.all_notes_data:
             content = data.get("content", "")
+            # 이전 버전 하위 호환
+            if content.startswith("<") or content.startswith("<!DOCTYPE"):
+                content = html_to_plain(content)
             if query_lower in content.lower():
-                lines = content.split('\n')
+                lines = [l.strip() for l in content.split('\n') if l.strip()]
                 title = lines[0][:30] if lines else "(내용 없음)"
                 if not title.strip(): title = "(내용 없음)"
                 
@@ -1372,7 +1453,6 @@ class StickyMemoApp:
         self.app.setQuitOnLastWindowClosed(False)
         
         self.slot_manager = SlotManager()  # 슬롯 매니저
-        self.is_desktop_mode = False
         
         self.notes = []
         self.all_notes_data = []
@@ -1422,9 +1502,11 @@ class StickyMemoApp:
         self.slot_action.setChecked(state)
         
     def _toggle_desktop_mode(self, checked):
-        self.is_desktop_mode = checked
+        """트레이에서 전체 메모 데스크탑 모드 토글"""
         for note in self.notes:
+            note.is_desktop = checked
             note.set_desktop_mode(checked)
+            note.schedule_save()
     
     def _create_icon(self):
         """트레이 아이콘 생성"""
