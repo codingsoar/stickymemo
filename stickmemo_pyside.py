@@ -9,6 +9,7 @@ import os
 import json
 import uuid
 import re
+import shutil
 from datetime import datetime
 import winreg
 import ctypes
@@ -27,13 +28,17 @@ from PySide6.QtGui import (
     QImage, QTextImageFormat
 )
 
-# --- 전역 설정 ---
 SAVE_DIR = os.path.join(os.path.expanduser("~"), "Documents", "StickyM")
 SAVE_FILE = os.path.join(SAVE_DIR, "notes_db.json")
 SLOTS_FILE = os.path.join(SAVE_DIR, "slots_db.json")
 IMAGES_DIR = os.path.join(SAVE_DIR, "images")
+TRASH_FILE = os.path.join(SAVE_DIR, "trash_db.json")
+BACKUP_DIR = os.path.join(SAVE_DIR, "backups")
 os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
+
+MAX_BACKUPS = 50  # 최대 백업 수
 
 # 메모 색상 팔레트
 NOTE_COLORS = [
@@ -1275,7 +1280,27 @@ class NoteListDialog(QDialog):
         
         row_layout.addLayout(info_layout, 1)
         
-        # 3. 삭제 버튼 (휴지통 -> X)
+        # 3. 데스크탑 위젯 모드 토글 버튼
+        is_desktop = data.get("desktop", False)
+        desktop_btn = QPushButton("🖥️" if is_desktop else "🖥")
+        desktop_btn.setFixedSize(48, 36)
+        desktop_btn.setCursor(Qt.PointingHandCursor)
+        desktop_btn.setToolTip("데스크탑 위젯 모드 해제" if is_desktop else "데스크탑 위젯 모드")
+        desktop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {"rgba(59, 130, 246, 0.3)" if is_desktop else "transparent"};
+                border: {"1px solid rgba(59, 130, 246, 0.5)" if is_desktop else "none"};
+                font-size: 14px;
+                border-radius: 6px;
+            }}
+            QPushButton:hover {{
+                background: rgba(59, 130, 246, 0.4);
+            }}
+        """)
+        desktop_btn.clicked.connect(lambda: self._on_toggle_desktop(data.get("uuid")))
+        row_layout.addWidget(desktop_btn)
+        
+        # 4. 삭제 버튼
         del_btn = QPushButton("❌")
         del_btn.setFixedSize(48, 36)
         del_btn.setCursor(Qt.PointingHandCursor)
@@ -1294,7 +1319,6 @@ class NoteListDialog(QDialog):
                 background: rgba(239, 68, 68, 0.4);
             }
         """)
-        # clicked 시그널 사용 (ClickableFrame에서 필터링됨)
         del_btn.clicked.connect(lambda: self._on_delete(data.get("uuid")))
         row_layout.addWidget(del_btn)
         
@@ -1344,6 +1368,25 @@ class NoteListDialog(QDialog):
     
     def _on_delete(self, uid):
         self.app.delete_note_by_uuid(uid)
+        self._refresh()
+    
+    def _on_toggle_desktop(self, uid):
+        """개별 메모 데스크탑 위젯 모드 토글"""
+        # 데이터에서 현재 상태 확인 및 반전
+        for data in self.app.all_notes_data:
+            if data.get("uuid") == uid:
+                new_state = not data.get("desktop", False)
+                data["desktop"] = new_state
+                
+                # 열려있는 메모면 즉시 적용
+                for note in self.app.notes:
+                    if note.uuid == uid:
+                        note.is_desktop = new_state
+                        note.set_desktop_mode(new_state)
+                        break
+                
+                self.app.save_notes()
+                break
         self._refresh()
     
     def _on_new(self):
@@ -1442,6 +1485,167 @@ class SearchDialog(QDialog):
         # 검색 창 닫지 않음 (연속 검색 위해) 또는 닫으려면 self.close() 추가
 
 
+class TrashDialog(QDialog):
+    """휴지통 다이얼로그"""
+    
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.setWindowTitle("🗑️ 휴지통")
+        self.setMinimumSize(450, 400)
+        self.setStyleSheet("""
+            QDialog { background-color: #0F172A; }
+            QLabel { color: white; }
+            QPushButton {
+                background-color: #1E293B;
+                color: white;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover { background-color: #334155; }
+            QScrollArea { border: none; background: transparent; }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # 헤더
+        header = QHBoxLayout()
+        title = QLabel("🗑️ 휴지통")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: white;")
+        header.addWidget(title)
+        header.addStretch()
+        
+        self.count_label = QLabel()
+        self.count_label.setStyleSheet("color: #94A3B8; font-size: 12px;")
+        header.addWidget(self.count_label)
+        
+        clear_btn = QPushButton("🧹 비우기")
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.setStyleSheet("QPushButton { background: rgba(239,68,68,0.2); border: 1px solid rgba(239,68,68,0.5); } QPushButton:hover { background: rgba(239,68,68,0.4); }")
+        clear_btn.clicked.connect(self._clear_trash)
+        header.addWidget(clear_btn)
+        layout.addLayout(header)
+        
+        # 스크롤 영역
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.list_widget = QWidget()
+        self.list_widget.setStyleSheet("background: transparent;")
+        self.list_layout = QVBoxLayout(self.list_widget)
+        self.list_layout.setAlignment(Qt.AlignTop)
+        self.list_layout.setSpacing(10)
+        scroll.setWidget(self.list_widget)
+        layout.addWidget(scroll)
+        
+        self._refresh()
+    
+    def _refresh(self):
+        while self.list_layout.count():
+            item = self.list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        trash = self.app._load_trash()
+        self.count_label.setText(f"{len(trash)}개의 메모")
+        
+        if not trash:
+            empty = QLabel("🎉 휴지통이 비어있습니다")
+            empty.setStyleSheet("color: #64748B; font-size: 14px; padding: 40px;")
+            empty.setAlignment(Qt.AlignCenter)
+            self.list_layout.addWidget(empty)
+            return
+        
+        for data in reversed(trash):  # 최신 삭제가 위에
+            self._add_row(data)
+    
+    def _add_row(self, data):
+        row = QFrame()
+        row.setStyleSheet("""
+            QFrame { background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(71, 85, 105, 0.5); border-radius: 10px; }
+            QFrame:hover { background: rgba(51, 65, 85, 0.9); }
+        """)
+        
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(15, 12, 15, 12)
+        row_layout.setSpacing(12)
+        
+        # 정보
+        info = QVBoxLayout()
+        content = data.get("content", "")
+        if content.startswith("<") or content.startswith("<!DOCTYPE"):
+            content = html_to_plain(content)
+        lines = [l.strip() for l in content.split('\n') if l.strip()]
+        title_text = lines[0][:40] if lines else "(내용 없음)"
+        
+        title = QLabel(title_text)
+        title.setStyleSheet("font-weight: bold; font-size: 13px; color: #E2E8F0; background: transparent; border: none;")
+        info.addWidget(title)
+        
+        deleted_at = data.get("deleted_at", "")
+        if deleted_at:
+            try:
+                dt = datetime.fromisoformat(deleted_at)
+                time_str = dt.strftime("%Y-%m-%d %H:%M")
+            except:
+                time_str = deleted_at
+            time_label = QLabel(f"🕐 {time_str}")
+            time_label.setStyleSheet("color: #64748B; font-size: 11px; background: transparent; border: none;")
+            info.addWidget(time_label)
+        
+        row_layout.addLayout(info, 1)
+        
+        btn_style = """
+            QPushButton { background: transparent; border: none; font-size: 14px; border-radius: 6px; padding: 4px 8px; }
+            QPushButton:hover { background: rgba(255,255,255,0.1); }
+        """
+        
+        # 복원 버튼
+        restore_btn = QPushButton("♻️")
+        restore_btn.setFixedSize(42, 36)
+        restore_btn.setCursor(Qt.PointingHandCursor)
+        restore_btn.setToolTip("복원")
+        restore_btn.setStyleSheet(btn_style)
+        restore_btn.clicked.connect(lambda: self._restore(data.get("uuid")))
+        row_layout.addWidget(restore_btn)
+        
+        # 영구 삭제 버튼
+        perm_btn = QPushButton("❌")
+        perm_btn.setFixedSize(42, 36)
+        perm_btn.setCursor(Qt.PointingHandCursor)
+        perm_btn.setToolTip("영구 삭제")
+        perm_btn.setStyleSheet(btn_style)
+        perm_btn.clicked.connect(lambda: self._perm_delete(data.get("uuid")))
+        row_layout.addWidget(perm_btn)
+        
+        self.list_layout.addWidget(row)
+    
+    def _restore(self, uid):
+        self.app.restore_note_from_trash(uid)
+        self._refresh()
+    
+    def _perm_delete(self, uid):
+        trash = self.app._load_trash()
+        trash = [d for d in trash if d.get("uuid") != uid]
+        self.app._save_trash(trash)
+        self._refresh()
+    
+    def _clear_trash(self):
+        trash = self.app._load_trash()
+        if not trash:
+            return
+        reply = QMessageBox.warning(
+            self, "🗑️ 휴지통 비우기",
+            f"{len(trash)}개의 메모가 영구 삭제됩니다.\n계속하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.app._save_trash([])
+            self._refresh()
+
+
 class StickyMemoApp:
     """메인 앱"""
     
@@ -1462,6 +1666,7 @@ class StickyMemoApp:
         
         self._load_notes()
         self._setup_tray()
+        self._register_hotkey()
         
         # 시작 프로그램 자동 등록 (강제)
         self.register_autostart()
@@ -1492,6 +1697,7 @@ class StickyMemoApp:
         menu.addSeparator()
         
         menu.addSeparator()
+        menu.addAction("🗑️ 휴지통", self.show_trash)
         menu.addAction("❌ 종료", self.quit)
         
         self.tray.setContextMenu(menu)
@@ -1577,12 +1783,43 @@ class StickyMemoApp:
                     break
         
         try:
+            # 저장 전 자동 백업
+            self._auto_backup()
             with open(SAVE_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.all_notes_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"저장 오류: {e}")
             
         self.refresh_list_dialog()
+    
+    def _auto_backup(self):
+        """저장 전 자동 백업 (최대 MAX_BACKUPS개 유지, 1분 간격 제한)"""
+        if not os.path.exists(SAVE_FILE):
+            return
+        try:
+            # 백업 간격 제한: 마지막 백업이 1분 이내면 건너뛰기
+            backups = sorted(
+                [f for f in os.listdir(BACKUP_DIR) if f.startswith("notes_backup_") and f.endswith(".json")]
+            )
+            if backups:
+                last_backup = backups[-1]  # notes_backup_YYYYMMDD_HHMMSS.json
+                try:
+                    ts = last_backup.replace("notes_backup_", "").replace(".json", "")
+                    last_time = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+                    if (datetime.now() - last_time).total_seconds() < 60:
+                        return  # 1분 이내 백업이 있으면 건너뛰기
+                except:
+                    pass
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = os.path.join(BACKUP_DIR, f"notes_backup_{timestamp}.json")
+            shutil.copy2(SAVE_FILE, backup_file)
+            
+            # 오래된 백업 정리
+            while len(backups) > MAX_BACKUPS:
+                os.remove(os.path.join(BACKUP_DIR, backups.pop(0)))
+        except Exception as e:
+            print(f"백업 오류: {e}")
     
     def show_or_open_note(self, uid):
         for note in self.notes:
@@ -1614,6 +1851,17 @@ class StickyMemoApp:
                     return
                 break
         
+        # 휴지통으로 이동
+        deleted_data = None
+        for data in self.all_notes_data:
+            if data.get("uuid") == uid:
+                deleted_data = data.copy()
+                deleted_data["deleted_at"] = datetime.now().isoformat()
+                break
+        
+        if deleted_data:
+            self._add_to_trash(deleted_data)
+        
         # 열린 창 닫기
         for note in self.notes[:]:
             if note.uuid == uid:
@@ -1623,6 +1871,56 @@ class StickyMemoApp:
         
         self.all_notes_data = [d for d in self.all_notes_data if d.get("uuid") != uid]
         self.save_notes()
+    
+    def _add_to_trash(self, data):
+        """메모를 휴지통에 추가"""
+        try:
+            trash = []
+            if os.path.exists(TRASH_FILE):
+                with open(TRASH_FILE, "r", encoding="utf-8") as f:
+                    trash = json.load(f)
+            trash.append(data)
+            with open(TRASH_FILE, "w", encoding="utf-8") as f:
+                json.dump(trash, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"휴지통 저장 오류: {e}")
+    
+    def _load_trash(self):
+        """휴지통 데이터 로드"""
+        try:
+            if os.path.exists(TRASH_FILE):
+                with open(TRASH_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except:
+            pass
+        return []
+    
+    def _save_trash(self, trash):
+        """휴지통 데이터 저장"""
+        try:
+            with open(TRASH_FILE, "w", encoding="utf-8") as f:
+                json.dump(trash, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"휴지통 저장 오류: {e}")
+    
+    def restore_note_from_trash(self, uid):
+        """휴지통에서 메모 복원"""
+        trash = self._load_trash()
+        restored = None
+        new_trash = []
+        for data in trash:
+            if data.get("uuid") == uid:
+                restored = data
+                restored.pop("deleted_at", None)
+            else:
+                new_trash.append(data)
+        
+        if restored:
+            self.all_notes_data.append(restored)
+            self._save_trash(new_trash)
+            self.save_notes()
+            # 복원된 메모 열기
+            self.show_or_open_note(uid)
     
     def show_note_list(self):
         # 이미 열려있으면 활성화만
@@ -1647,6 +1945,16 @@ class StickyMemoApp:
         """열려있는 목록 창 갱신"""
         if hasattr(self, 'note_list_dialog') and self.note_list_dialog.isVisible():
             self.note_list_dialog._refresh()
+    
+    def show_trash(self):
+        """휴지통 다이얼로그 표시"""
+        if hasattr(self, 'trash_dialog') and self.trash_dialog.isVisible():
+            self.trash_dialog.raise_()
+            self.trash_dialog.activateWindow()
+            self.trash_dialog._refresh()
+            return
+        self.trash_dialog = TrashDialog(self)
+        self.trash_dialog.show()
     
     def show_all_notes(self):
         """모든 메모 보이기 (닫힌 메모도 포함)"""
@@ -1691,13 +1999,79 @@ class StickyMemoApp:
         except Exception as e:
             print(f"자동 시작 등록 오류: {e}")
     
+    def _register_hotkey(self):
+        """Ctrl+` 전역 단축키 등록"""
+        self._hotkey_id = 1
+        self._hotkey_window = HotkeyWindow(self)
+        self._hotkey_window.show()  # show 후 hide 해야 HWND가 생성됨
+        self._hotkey_window.hide()
+        
+        MOD_CONTROL = 0x0002
+        VK_OEM_3 = 0xC0  # ` (백틱) 키
+        hwnd = int(self._hotkey_window.winId())
+        
+        result = windll.user32.RegisterHotKey(hwnd, self._hotkey_id, MOD_CONTROL, VK_OEM_3)
+        if result:
+            print("✅ 전역 단축키 등록: Ctrl+`")
+        else:
+            print("⚠️ 전역 단축키 등록 실패 (이미 사용 중일 수 있음)")
+    
+    def _on_hotkey(self):
+        """Ctrl+` 단축키 처리: 데스크탑 모드 토글"""
+        desktop_notes = [n for n in self.notes if n.is_desktop]
+        
+        if desktop_notes:
+            # 데스크탑 모드 메모가 있으면 → 모두 해제
+            for note in desktop_notes:
+                note.is_desktop = False
+                note.set_desktop_mode(False)
+                note.schedule_save()
+            self.desktop_action.setChecked(False)
+        else:
+            # 없으면 → 모든 메모를 데스크탑 모드로
+            for note in self.notes:
+                note.is_desktop = True
+                note.set_desktop_mode(True)
+                note.schedule_save()
+            self.desktop_action.setChecked(True)
+    
     def quit(self):
+        # 전역 단축키 해제
+        if hasattr(self, '_hotkey_window'):
+            hwnd = int(self._hotkey_window.winId())
+            windll.user32.UnregisterHotKey(hwnd, self._hotkey_id)
         self.save_notes()
         self.tray.hide()
         self.app.quit()
     
     def run(self):
         return self.app.exec()
+
+
+class HotkeyWindow(QWidget):
+    """전역 단축키 수신을 위한 숨겨진 윈도우"""
+    
+    WM_HOTKEY = 0x0312
+    
+    def __init__(self, memo_app):
+        super().__init__()
+        self.memo_app = memo_app
+        self.setWindowTitle("StickyMemo_Hotkey")
+        self.setFixedSize(0, 0)
+    
+    def nativeEvent(self, eventType, message):
+        try:
+            if eventType == b"windows_generic_MSG" or eventType == b"windows_dispatcher_MSG":
+                import ctypes.wintypes
+                msg_ptr = int(message)
+                if msg_ptr:
+                    msg = ctypes.wintypes.MSG.from_address(msg_ptr)
+                    if msg.message == self.WM_HOTKEY and msg.wParam == self.memo_app._hotkey_id:
+                        QTimer.singleShot(0, self.memo_app._on_hotkey)
+                        return True, 0
+        except Exception:
+            pass
+        return super().nativeEvent(eventType, message)
 
 
 if __name__ == "__main__":
